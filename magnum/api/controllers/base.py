@@ -1,3 +1,4 @@
+# Copyright 2013 Hewlett-Packard Development Company, L.P.
 # All Rights Reserved.
 #
 #    Licensed under the Apache License, Version 2.0 (the "License"); you may
@@ -12,216 +13,255 @@
 #    License for the specific language governing permissions and limitations
 #    under the License.
 
-import datetime
-import operator
+# NOTE: Ported from ceilometer/tests/api.py (subsequently moved to
+# ceilometer/tests/api/__init__.py). This should be oslo'ified:
+# https://bugs.launchpad.net/ironic/+bug/1255115.
 
-from magnum.api.controllers import versions
-from magnum.api import versioned_method
-from magnum.common import exception
-from magnum.i18n import _
-from pecan import rest
-from webob import exc
-import wsme
-from wsme import types as wtypes
+# NOTE(deva): import auth_token so we can override a config option
+from unittest import mock
+from urllib import parse as urlparse
 
+from keystonemiddleware import auth_token  # noqa
+from oslo_config import cfg
+import pecan
+import pecan.testing
 
-# name of attribute to keep version method information
-VER_METHOD_ATTR = 'versioned_methods'
+from magnum.api import hooks
+from magnum.tests.unit.db import base
 
-
-class APIBase(wtypes.Base):
-
-    created_at = wsme.wsattr(datetime.datetime, readonly=True)
-    """The time in UTC at which the object is created"""
-
-    updated_at = wsme.wsattr(datetime.datetime, readonly=True)
-    """The time in UTC at which the object is updated"""
-
-    def as_dict(self):
-        """Render this object as a dict of its fields."""
-        return {k: getattr(self, k)
-                for k in self.fields
-                if hasattr(self, k) and
-                getattr(self, k) != wsme.Unset}
-
-    def unset_fields_except(self, except_list=None):
-        """Unset fields so they don't appear in the message body.
-
-        :param except_list: A list of fields that won't be touched.
-
-        """
-        if except_list is None:
-            except_list = []
-
-        for k in self.as_dict():
-            if k not in except_list:
-                setattr(self, k, wsme.Unset)
+PATH_PREFIX = '/v1'
 
 
-class ControllerMetaclass(type):
-    """Controller metaclass.
+class FunctionalTest(base.DbTestCase):
+    """Base class for API tests.
 
-    This metaclass automates the task of assembling a dictionary
-    mapping action keys to method names.
+    Pecan controller test. Used for functional tests of Pecan controllers where
+    you need to test your literal application and its integration with the
+    framework.
     """
 
-    def __new__(mcs, name, bases, cls_dict):
-        """Adds version function dictionary to the class."""
+    def setUp(self):
+        super(FunctionalTest, self).setUp()
+        cfg.CONF.set_override("auth_version", "v2.0",
+                              group='keystone_authtoken')
+        cfg.CONF.set_override("admin_user", "admin",
+                              group='keystone_authtoken')
 
-        versioned_methods = None
+        # Determine where we are so we can set up paths in the config
+        self.config = {
+            'app': {
+                'root': 'magnum.api.controllers.root.RootController',
+                'modules': ['magnum.api'],
+                'hooks': [
+                    hooks.ContextHook(),
+                    hooks.RPCHook(),
+                    hooks.NoExceptionTracebackHook(),
+                ],
+            },
+        }
 
-        for base in bases:
-            if base.__name__ == "Controller":
-                # NOTE(cyeoh): This resets the VER_METHOD_ATTR attribute
-                # between API controller class creations. This allows us
-                # to use a class decorator on the API methods that doesn't
-                # require naming explicitly what method is being versioned as
-                # it can be implicit based on the method decorated. It is a bit
-                # ugly.
-                if VER_METHOD_ATTR in base.__dict__:
-                    versioned_methods = getattr(base, VER_METHOD_ATTR)
-                    delattr(base, VER_METHOD_ATTR)
+        self.app = self._make_app()
 
-        if versioned_methods:
-            cls_dict[VER_METHOD_ATTR] = versioned_methods
+        def reset_pecan():
+            pecan.set_config({}, overwrite=True)
 
-        return super(ControllerMetaclass, mcs).__new__(mcs, name, bases,
-                                                       cls_dict)
+        self.addCleanup(reset_pecan)
 
+        p = mock.patch('magnum.api.controllers.v1.Controller._check_version')
+        self._check_version = p.start()
+        self.addCleanup(p.stop)
 
-class Controller(rest.RestController, metaclass=ControllerMetaclass):
-    """Base Rest Controller"""
+    def _verify_attrs(self, attrs, response, positive=True):
+        if positive is True:
+            verify_method = self.assertIn
+        else:
+            verify_method = self.assertNotIn
+        for attr in attrs:
+            verify_method(attr, response)
 
-    def __getattribute__(self, key):
+    def _make_app(self, config=None):
+        if not config:
+            config = self.config
 
-        def version_select():
-            """Select the correct method based on version
+        return pecan.testing.load_test_app(config)
 
-            @return: Returns the correct versioned method
-            @raises: HTTPNotAcceptable if there is no method which
-                 matches the name and version constraints
-            """
+    def _request_json(self, path, params, expect_errors=False, headers=None,
+                      method="post", extra_environ=None, status=None,
+                      path_prefix=PATH_PREFIX):
+        """Sends simulated HTTP request to Pecan test app.
 
-            from pecan import request
-            ver = request.version
+        :param path: url path of target service
+        :param params: content for wsgi.input of request
+        :param expect_errors: Boolean value; whether an error is expected based
+                              on request
+        :param headers: a dictionary of headers to send along with the request
+        :param method: Request method type. Appropriate method function call
+                       should be used rather than passing attribute in.
+        :param extra_environ: a dictionary of environ variables to send along
+                              with the request
+        :param status: expected status code of response
+        :param path_prefix: prefix of the url path
+        """
+        full_path = path_prefix + path
+        print('%s: %s %s' % (method.upper(), full_path, params))
+        response = getattr(self.app, "%s_json" % method)(
+            str(full_path),
+            params=params,
+            headers=headers,
+            status=status,
+            extra_environ=extra_environ,
+            expect_errors=expect_errors
+        )
+        print('GOT:%s' % response)
+        return response
 
-            func_list = self.versioned_methods[key]
-            for func in func_list:
-                if ver.matches(func.start_version, func.end_version):
-                    return func.func
+    def put_json(self, path, params, expect_errors=False, headers=None,
+                 extra_environ=None, status=None):
+        """Sends simulated HTTP PUT request to Pecan test app.
 
-            raise exc.HTTPNotAcceptable(_(
-                "Version %(ver)s was requested but the requested API %(api)s "
-                "is not supported for this version.") % {'ver': ver,
-                                                         'api': key})
+        :param path: url path of target service
+        :param params: content for wsgi.input of request
+        :param expect_errors: Boolean value; whether an error is expected based
+                              on request
+        :param headers: a dictionary of headers to send along with the request
+        :param extra_environ: a dictionary of environ variables to send along
+                              with the request
+        :param status: expected status code of response
+        """
+        # Provide member role for put request
+        if not headers:
+            headers = {"X-Roles": "member"}
+        return self._request_json(path=path, params=params,
+                                  expect_errors=expect_errors,
+                                  headers=headers, extra_environ=extra_environ,
+                                  status=status, method="put")
 
+    def post_json(self, path, params, expect_errors=False, headers=None,
+                  extra_environ=None, status=None):
+        """Sends simulated HTTP POST request to Pecan test app.
+
+        :param path: url path of target service
+        :param params: content for wsgi.input of request
+        :param expect_errors: Boolean value; whether an error is expected based
+                              on request
+        :param headers: a dictionary of headers to send along with the request
+        :param extra_environ: a dictionary of environ variables to send along
+                              with the request
+        :param status: expected status code of response
+        """
+        # Provide member role for post request
+        if not headers:
+            headers = {"X-Roles": "member"}
+        return self._request_json(path=path, params=params,
+                                  expect_errors=expect_errors,
+                                  headers=headers, extra_environ=extra_environ,
+                                  status=status, method="post")
+
+    def patch_json(self, path, params, expect_errors=False, headers=None,
+                   extra_environ=None, status=None):
+        """Sends simulated HTTP PATCH request to Pecan test app.
+
+        :param path: url path of target service
+        :param params: content for wsgi.input of request
+        :param expect_errors: Boolean value; whether an error is expected based
+                              on request
+        :param headers: a dictionary of headers to send along with the request
+        :param extra_environ: a dictionary of environ variables to send along
+                              with the request
+        :param status: expected status code of response
+        """
+        # Provide member role for patch request
+        if not headers:
+            headers = {"X-Roles": "member"}
+        return self._request_json(path=path, params=params,
+                                  expect_errors=expect_errors,
+                                  headers=headers, extra_environ=extra_environ,
+                                  status=status, method="patch")
+
+    def delete(self, path, expect_errors=False, headers=None,
+               extra_environ=None, status=None, path_prefix=PATH_PREFIX):
+        """Sends simulated HTTP DELETE request to Pecan test app.
+
+        :param path: url path of target service
+        :param expect_errors: Boolean value; whether an error is expected based
+                              on request
+        :param headers: a dictionary of headers to send along with the request
+        :param extra_environ: a dictionary of environ variables to send along
+                              with the request
+        :param status: expected status code of response
+        :param path_prefix: prefix of the url path
+        """
+        full_path = path_prefix + path
+        print('DELETE: %s' % (full_path))
+        # Provide member role for delete request
+        if not headers:
+            headers = {"X-Roles": "member"}
+        response = self.app.delete(str(full_path),
+                                   headers=headers,
+                                   status=status,
+                                   extra_environ=extra_environ,
+                                   expect_errors=expect_errors)
+        print('GOT:%s' % response)
+        return response
+
+    def get_json(self, path, expect_errors=False, headers=None,
+                 extra_environ=None, q=None, path_prefix=PATH_PREFIX,
+                 **params):
+        """Sends simulated HTTP GET request to Pecan test app.
+
+        :param path: url path of target service
+        :param expect_errors: Boolean value;whether an error is expected based
+                              on request
+        :param headers: a dictionary of headers to send along with the request
+        :param extra_environ: a dictionary of environ variables to send along
+                              with the request
+        :param q: list of queries consisting of: field, value, op, and type
+                  keys
+        :param path_prefix: prefix of the url path
+        :param params: content for wsgi.input of request
+        """
+        if q is None:
+            q = []
+        full_path = path_prefix + path
+        query_params = {'q.field': [],
+                        'q.value': [],
+                        'q.op': [],
+                        }
+
+        # Provide reader role for get request
+        if not headers:
+            headers = {"X-Roles": "reader"}
+        for query in q:
+            for name in ['field', 'op', 'value']:
+                query_params['q.%s' % name].append(query.get(name, ''))
+        all_params = {}
+        all_params.update(params)
+        if q:
+            all_params.update(query_params)
+        print('GET: %s %r' % (full_path, all_params))
+        response = self.app.get(full_path,
+                                params=all_params,
+                                headers=headers,
+                                extra_environ=extra_environ,
+                                expect_errors=expect_errors)
+        if not expect_errors:
+            response = response.json
+        print('GOT:%s' % response)
+        return response
+
+    def validate_link(self, link, bookmark=False):
+        """Checks if the given link can get correct data."""
+        # removes the scheme and net location parts of the link
+        url_parts = list(urlparse.urlparse(link))
+        url_parts[0] = url_parts[1] = ''
+
+        # bookmark link should not have the version in the URL
+        if bookmark and url_parts[2].startswith(PATH_PREFIX):
+            return False
+
+        full_path = urlparse.urlunparse(url_parts)
         try:
-            version_meth_dict = object.__getattribute__(self, VER_METHOD_ATTR)
-        except AttributeError:
-            # No versioning on this class
-            return object.__getattribute__(self, key)
-        if version_meth_dict and key in version_meth_dict:
-            return version_select().__get__(self, self.__class__)
-
-        return object.__getattribute__(self, key)
-
-    # NOTE: This decorator MUST appear first (the outermost
-    # decorator) on an API method for it to work correctly
-    @classmethod
-    def api_version(cls, min_ver, max_ver=None):
-        """Decorator for versioning api methods.
-
-        Add the decorator to any pecan method that has been exposed.
-        This decorator will store the method, min version, and max
-        version in a list for each api. It will check that there is no
-        overlap between versions and methods. When the api is called the
-        controller will use the list for each api to determine which
-        method to call.
-
-        Example:
-            @base.Controller.api_version("1.1", "1.2")
-            @expose.expose(Cluster, types.uuid_or_name)
-            def get_one(self, cluster_ident):
-            {...code for versions 1.1 to 1.2...}
-
-            @base.Controller.api_version("1.3")
-            @expose.expose(Cluster, types.uuid_or_name)
-            def get_one(self, cluster_ident):
-            {...code for versions 1.3 to latest}
-
-        @min_ver: string representing minimum version
-        @max_ver: optional string representing maximum version
-        @raises: ApiVersionsIntersect if an version overlap is found between
-            method versions.
-        """
-
-        def decorator(f):
-            obj_min_ver = versions.Version('', '', '', min_ver)
-            if max_ver:
-                obj_max_ver = versions.Version('', '', '', max_ver)
-            else:
-                obj_max_ver = versions.Version('', '', '',
-                                               versions.CURRENT_MAX_VER)
-
-            # Add to list of versioned methods registered
-            func_name = f.__name__
-            new_func = versioned_method.VersionedMethod(
-                func_name, obj_min_ver, obj_max_ver, f)
-
-            func_dict = getattr(cls, VER_METHOD_ATTR, {})
-            if not func_dict:
-                setattr(cls, VER_METHOD_ATTR, func_dict)
-
-            func_list = func_dict.get(func_name, [])
-            if not func_list:
-                func_dict[func_name] = func_list
-            func_list.append(new_func)
-
-            is_intersect = Controller.check_for_versions_intersection(
-                func_list)
-
-            if is_intersect:
-                raise exception.ApiVersionsIntersect(
-                    name=new_func.name,
-                    min_ver=new_func.start_version,
-                    max_ver=new_func.end_version
-                )
-
-            # Ensure the list is sorted by minimum version (reversed)
-            # so later when we work through the list in order we find
-            # the method which has the latest version which supports
-            # the version requested.
-            func_list.sort(key=lambda f: f.start_version, reverse=True)
-
-            return f
-
-        return decorator
-
-    @staticmethod
-    def check_for_versions_intersection(func_list):
-        """Determines whether function list intersections
-
-        General algorithm:
-        https://en.wikipedia.org/wiki/Intersection_algorithm
-
-        :param func_list: list of VersionedMethod objects
-        :return: boolean
-        """
-
-        pairs = []
-        counter = 0
-
-        for f in func_list:
-            pairs.append((f.start_version, 1))
-            pairs.append((f.end_version, -1))
-
-        pairs.sort(key=operator.itemgetter(1), reverse=True)
-        pairs.sort(key=operator.itemgetter(0))
-
-        for p in pairs:
-            counter += p[1]
-
-            if counter > 1:
-                return True
-
-        return False
+            self.get_json(full_path, path_prefix='')
+            return True
+        except Exception:
+            return False
